@@ -8,24 +8,28 @@ import numpy as np
 from ultralytics import YOLO
 import os
 from ament_index_python.packages import get_package_share_directory
-# --- NEW IMPORT ---
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 class TomatoPerceptionNode(Node):
     def __init__(self):
         super().__init__('tomato_perception_node')
         
-        # 1. Initialize YOLO
+        # 1. Initialize Dual Models
         package_share_directory = get_package_share_directory('tomato_perception')
-        model_path = os.path.join(package_share_directory, 'models', 'cherry_tomato_ripeness_detection_model.pt')
-        self.model = YOLO(model_path)
-        self.bridge = CvBridge()
+        ripeness_path = os.path.join(package_share_directory, 'models', 'cherry_tomato_ripeness_detection_model.pt')
+        self.model_ripeness = YOLO(ripeness_path)
         
+        stem_path = os.path.join(package_share_directory, 'models', 'stem_segmentation_model.pt')
+        self.model_stem = YOLO(stem_path)
+        
+        self.bridge = CvBridge()
         self.camera_matrix = None
         self.depth_image = None
+        
+        # --- NEW: Frame Counter for Logging ---
+        self.frame_count = 0
 
-        # --- 2. DEFINE THE SENSOR QoS PROFILE ---
-        # This matches what the Orbbec Gemini is sending
+        # 2. QoS Profile
         self.sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -33,88 +37,132 @@ class TomatoPerceptionNode(Node):
         )
 
         # 3. GUI Setup
-        cv2.namedWindow("Cherry Tomato Detection", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Cherry Tomato Ripeness Detection", cv2.WINDOW_NORMAL)
         cv2.startWindowThread()
 
-        # 4. ROS Subscribers (Updated with QoS)
-        self.image_sub = self.create_subscription(
-            Image, '/camera/color/image_raw', self.rgb_callback, 10)
-        
-        # We apply the Best Effort QoS here specifically for depth
-        self.depth_sub = self.create_subscription(
-            Image, '/camera/depth/image_raw', self.depth_callback, self.sensor_qos)
-        
-        self.info_sub = self.create_subscription(
-            CameraInfo, '/camera/color/camera_info', self.info_callback, 10)
-        
+        # 4. ROS Communication
+        self.image_sub = self.create_subscription(Image, '/camera/color/image_raw', self.rgb_callback, 10)
+        self.depth_sub = self.create_subscription(Image, '/camera/depth/image_raw', self.depth_callback, self.sensor_qos)
+        self.info_sub = self.create_subscription(CameraInfo, '/camera/color/camera_info', self.info_callback, 10)
         self.target_pub = self.create_publisher(PoseStamped, '/harvest_target/pose', 10)
 
-        self.get_logger().info("Node Started! Looking for Depth via Best Effort QoS...")
+        self.get_logger().info("System Ready. Logs will update once per second.")
 
     def info_callback(self, msg):
         if self.camera_matrix is None:
             self.camera_matrix = np.array(msg.k).reshape((3, 3))
-            self.get_logger().info("Camera Intrinsics Captured.")
 
     def depth_callback(self, msg):
-        # Once this runs, the warning in Terminal 2 will disappear!
-        if self.depth_image is None:
-            self.get_logger().info("Depth connection established!")
         self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
 
     def rgb_callback(self, msg):
         if self.depth_image is None or self.camera_matrix is None:
             return
 
-        cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        results = self.model(cv_image, conf=0.5, verbose=False)
-        res = results[0]
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        except Exception:
+            return
         
-        # Display Window
-        annotated_frame = res.plot()
-        cv2.imshow("Cherry Tomato Detection", annotated_frame)
-        cv2.waitKey(1) 
+        # 1. Run Ripeness Detection
+        results_ripeness = self.model_ripeness(cv_image, conf=0.3, verbose=False)
+        display_frame = results_ripeness[0].plot()
+        
+        # Initialize counters (These reset to 0 every single frame)
+        total_tomatoes = len(results_ripeness[0].boxes)
+        ripe_count = 0
+        semi_count = 0
+        unripe_count = 0
+        stems_segmented = 0
 
-        # 3D Calculation logic
-        if len(res.boxes) > 0:
-            # Get the first box (closest or highest confidence)
-            box = res.boxes[0]
+        for box in results_ripeness[0].boxes:
+            cls_id = int(box.cls[0])
+            label = self.model_ripeness.names[cls_id].lower()
             
-            # Get center coordinates of the bounding box (u, v)
-            # box.xywh returns [center_x, center_y, width, height]
-            u = int(box.xywh[0][0]) 
-            v = int(box.xywh[0][1])
-            
-            self.get_logger().info(f"Targeting Box Center: Pixel ({u}, {v})")
-
-            try:
-                z_mm = float(self.depth_image[v, u])
+            # Count the types
+            if 'semi' in label:
+                semi_count += 1
+            elif 'unripe' in label:
+                unripe_count += 1
+            elif 'ripe' in label:
+                ripe_count += 1
                 
-                if z_mm > 0:
-                    # Camera intrinsics
-                    fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
-                    cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
+                # 2. Run Stem Segmentation (ROI)
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                pad_top, pad_side, pad_bottom = 70, 40, 10
+                roi_x1 = max(0, x1 - pad_side)
+                roi_y1 = max(0, y1 - pad_top)
+                roi_x2 = min(cv_image.shape[1], x2 + pad_side)
+                roi_y2 = min(cv_image.shape[0], y2 + pad_bottom)
+                
+                roi_img = cv_image[roi_y1:roi_y2, roi_x1:roi_x2]
 
-                    # Convert to 3D Meters
-                    tx = (u - cx) * z_mm / fx / 1000.0
-                    ty = (v - cy) * z_mm / fy / 1000.0
-                    tz = z_mm / 1000.0
-
-                    # Create Pose message
-                    target = PoseStamped()
-                    target.header.stamp = self.get_clock().now().to_msg()
-                    target.header.frame_id = "camera_link"
-                    target.pose.position.x = tx
-                    target.pose.position.y = ty
-                    target.pose.position.z = tz
-                    target.pose.orientation.w = 1.0
+                results_stem = self.model_stem(roi_img, conf=0.15, verbose=False, retina_masks=True)
+                
+                if len(results_stem[0].boxes) > 0:
+                    stem_res = results_stem[0]
                     
-                    self.target_pub.publish(target)
-                    self.get_logger().info(f"!!! PUBLISHED !!! X:{tx:.2f} Y:{ty:.2f} Z:{tz:.2f}")
-                else:
-                    self.get_logger().warn(f"Depth at ({u},{v}) is 0.0. Move further away.")
-            except Exception as e:
-                self.get_logger().error(f"Calculation Error: {e}")
+                    if stem_res.masks is not None:
+                        mask_binary = stem_res.masks.data[0].cpu().numpy()
+                        mask_binary = cv2.resize(mask_binary, (roi_img.shape[1], roi_img.shape[0]))
+                        mask_coords = np.argwhere(mask_binary > 0.5)
+
+                        if len(mask_coords) > 0:
+                            stems_segmented += 1
+                            
+                            # Draw Blue Overlay
+                            roi_area = display_frame[roi_y1:roi_y2, roi_x1:roi_x2]
+                            blue_overlay = roi_area.copy()
+                            blue_overlay[mask_binary > 0.5] = [255, 0, 0]
+                            cv2.addWeighted(blue_overlay, 0.4, roi_area, 0.6, 0, roi_area)
+
+                            # Calculate Target
+                            v_roi, u_roi = np.mean(mask_coords, axis=0).astype(int)
+                            u_full = u_roi + roi_x1
+                            v_full = v_roi + roi_y1
+                            
+                            # Draw Red Target Dot
+                            cv2.circle(display_frame, (u_full, v_full), 6, (0, 0, 255), -1)
+                            cv2.putText(display_frame, "STEM", (u_full+10, v_full-10), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+                            # Publish 3D Pose
+                            try:
+                                if 0 <= v_full < self.depth_image.shape[0] and 0 <= u_full < self.depth_image.shape[1]:
+                                    z_mm = float(self.depth_image[v_full, u_full])
+                                    if z_mm > 0:
+                                        fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
+                                        cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
+                                        tx = (u_full - cx) * z_mm / fx / 1000.0
+                                        ty = (v_full - cy) * z_mm / fy / 1000.0
+                                        tz = z_mm / 1000.0
+
+                                        target = PoseStamped()
+                                        target.header.stamp = self.get_clock().now().to_msg()
+                                        target.header.frame_id = "camera_link"
+                                        target.pose.position.x = tx
+                                        target.pose.position.y = ty
+                                        target.pose.position.z = tz
+                                        target.pose.orientation.w = 1.0
+                                        self.target_pub.publish(target)
+                            except Exception:
+                                pass
+
+        # --- LOG THROTTLING ---
+        # Increment frame counter
+        self.frame_count += 1
+        
+        # Only print log every 30 frames (Approx 1 second if camera is 30fps)
+        if self.frame_count % 30 == 0:
+            if total_tomatoes > 0:
+                self.get_logger().info(
+                    f"Status: Detected {total_tomatoes} | Ripe: {ripe_count} | Semi: {semi_count} | Unripe: {unripe_count} | Stems Targeted: {stems_segmented}"
+                )
+            else:
+                self.get_logger().info("Searching for tomatoes...", throttle_duration_sec=2.0)
+
+        cv2.imshow("Cherry Tomato Ripeness Detection", display_frame)
+        cv2.waitKey(1)
 
 def main(args=None):
     rclpy.init(args=args)
