@@ -1,0 +1,17 @@
+Log file created at: 2025/12/17 17:19:40
+Running on machine: ubuntu
+Running duration (h:mm:ss): 0:00:00
+Log line format: [IWEF]yyyymmdd hh:mm:ss.uuuuuu threadid file:line] msg
+[I20251217 17:19:40.768877 126309 DeviceManager.cpp:54] DeviceManager init ...
+[I20251217 17:19:40.769209 126309 LinuxPal.cpp:21] createObPal: create LinuxPal!
+[I20251217 17:19:40.937839 126309 EnumeratorLibusb.cpp:325] queryDevicesInfo done!
+[I20251217 17:19:40.938082 126309 DeviceManager.cpp:373] Current usb device port list::
+[I20251217 17:19:40.938115 126309 DeviceManager.cpp:375]         - 2-1.1.2-5.0 | Orbbec(R) Astra(TM) 3D Camera(F) Depth
+[I20251217 17:19:40.938131 126309 DeviceManager.cpp:375]         - 1-2.1.1-6.0 | USB Camera
+[W20251217 17:19:40.938171 126309 OpenNIDeviceInfo.cpp:172] New openni device matched.
+[I20251217 17:19:40.938212 126309 DeviceManager.cpp:345] Devices matched:
+[I20251217 17:19:40.938227 126309 DeviceManager.cpp:359]   - openniDevice = 1
+[I20251217 17:19:40.938592 126309 LinuxPal.cpp:142] Create PollingDeviceWatcher!
+[I20251217 17:19:40.938630 126309 DeviceManager.cpp:99] DeviceManager init  done!
+[I20251217 17:19:40.938645 126309 DeviceManager.cpp:50] DeviceManager construct done
+[I20251217 17:19:40.938658 126309 Context.cpp:51] Context created!
