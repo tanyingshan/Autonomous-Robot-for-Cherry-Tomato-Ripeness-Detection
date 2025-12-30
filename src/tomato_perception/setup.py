@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'tomato_node = tomato_perception.tomato_node:main',
+            'harvest_control = tomato_perception.harvest_control:main',
         ],
     },
 )
