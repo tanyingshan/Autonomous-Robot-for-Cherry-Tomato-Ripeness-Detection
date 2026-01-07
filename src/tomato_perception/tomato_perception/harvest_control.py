@@ -51,13 +51,15 @@ class HarvestControlNode(Node):
         self.state = "IDLE" 
         self.latest_target = None
 
-        self.get_logger().info("Waiting for MoveIt...")
+        self.get_logger().info("Connecting to MoveIt Server...")
         self.move_group_client.wait_for_server()
-        self.get_logger().info("READY. MODE: LIVE ACTION (Real Cutting).")
         
-        # Optional: Reset tools to closed state on startup? 
-        # Uncomment next line if you want immediate reset
-        # self.execute_tool_command("BOTH_CLOSE", "IDLE", plan_only=False)
+        # --- UI: STARTUP BANNER ---
+        print("\n" + "="*50)
+        print("   HARVEST CONTROLLER ONLINE")
+        print("   [MODE] : LIVE ACTION (REAL CUTTING)")
+        print("   [STATUS]: Waiting for target...")
+        print("="*50 + "\n")
 
     def target_callback(self, msg):
         if self.state != "IDLE": return
@@ -65,7 +67,12 @@ class HarvestControlNode(Node):
         if dist > self.max_reach: return
 
         self.latest_target = msg
-        self.get_logger().info("Tomato Detected! Preparing Tools...")
+        
+        # --- UI: NEW CYCLE HEADER ---
+        print("\n" + "-"*40)
+        self.get_logger().info(">>> NEW HARVEST CYCLE DETECTED")
+        self.get_logger().info(f"[PLAN] Target Distance: {dist:.2f} meters")
+        
         # Step 1: Open Everything
         self.execute_tool_command("BOTH_OPEN", "PRE_APPROACH", plan_only=False)
 
@@ -138,31 +145,31 @@ class HarvestControlNode(Node):
 
         # 1. CUTTER OPENED -> OPEN GRIPPER
         if self.state == "PRE_APPROACH":
-            self.get_logger().info("Cutter Open. Opening Gripper...")
+            self.get_logger().info("[ACTION] Tools Opening...")
             # Reuse the single Open command but change state
             self.execute_single_gripper("OPEN", "APPROACHING")
 
         # 2. TOOLS READY -> MOVE ARM
         elif self.state == "APPROACHING":
             self.clear_octomap()
-            self.get_logger().info("Moving Arm to Tomato...")
+            self.get_logger().info("[ACTION] Moving Arm to Tomato...")
             self.execute_arm_move()
 
         # 3. ARM ARRIVED -> GRIP (HOLD)
         elif self.state == "GRIPPING":
-            self.get_logger().info("Gripping Tomato...")
+            self.get_logger().info("[ACTION] Arrived at Target. Gripping...")
             self.execute_tool_command("GRIPPER_HOLD", "CUTTING", plan_only=False)
 
         # 4. GRIPPED -> PERFORM CUT (REAL)
         elif self.state == "CUTTING":
             time.sleep(0.5) # Small pause before cut
-            self.get_logger().info("PERFORMING CUT ACTION...")
+            self.get_logger().info("[ACTION] >>> EXECUTING CUT <<<")
             self.execute_tool_command("CUTTER_CLOSE", "RELEASING", plan_only=False)
 
         # 5. CUT DONE -> OPEN EVERYTHING
         elif self.state == "RELEASING":
             time.sleep(0.5) 
-            self.get_logger().info("Releasing...")
+            self.get_logger().info("[ACTION] Releasing...")
             # We open cutter first
             self.execute_tool_command("BOTH_OPEN", "FINAL_OPEN", plan_only=False)
             
@@ -172,17 +179,19 @@ class HarvestControlNode(Node):
 
         # 7. OPEN -> MOVE TO REST
         elif self.state == "RETREATING":
-            self.get_logger().info("Moving to Rest Position...")
+            self.get_logger().info("[ACTION] Retreating to Rest Position...")
             self.execute_move_to_rest()
             
         # 8. AT REST -> CLOSE EVERYTHING (RESET)
         elif self.state == "RESETTING":
-            self.get_logger().info("Closing Tools (Reset)...")
+            self.get_logger().info("[ACTION] Resetting Tools to Closed State...")
             self.execute_tool_command("BOTH_CLOSE", "FINAL_RESET", plan_only=False)
 
         # 9. CUTTER CLOSED -> CLOSE GRIPPER
         elif self.state == "FINAL_RESET":
             self.execute_single_gripper("CLOSE", "IDLE")
+            self.get_logger().info("[SUCCESS] Cycle Complete. Robot Ready.")
+            print("-" * 40 + "\n") # End separator
 
     # --- HELPER: SINGLE GRIPPER COMMAND ---
     def execute_single_gripper(self, action, next_state):
@@ -283,7 +292,7 @@ class HarvestControlNode(Node):
         goal_handle.get_result_async().add_done_callback(self.rest_result_callback)
 
     def rest_result_callback(self, future):
-        self.get_logger().info("At Rest. Resetting tools...")
+        self.get_logger().info("[ACTION] Robot Home. Closing Tools...")
         self.state = "RESETTING"
         self.tool_result_callback(future)
 
