@@ -18,7 +18,7 @@ class HarvestControlNode(Node):
         # --- GROUPS ---
         self.arm_group_name = "arm_group"
         self.gripper_group_name = "gripper_group"
-        self.cutter_group_name = "cutter_group"  # <--- NEW GROUP
+        self.cutter_group_name = "cutter_group"
         
         self.base_frame = "base_link"
         self.ee_link = "tcp_link"
@@ -31,25 +31,20 @@ class HarvestControlNode(Node):
         # --- ANGLES (Radians) ---
         # Gripper
         self.gripper_open_val = math.radians(17.0)
-        self.gripper_closed_val = math.radians(5.0) # Grip (Hold)
+        self.gripper_hold_val = math.radians(5.0)   # Hold Tomato
+        self.gripper_closed_val = math.radians(0.0) # Fully Closed (Rest)
 
-        # Cutter (Predefined States)
-        # Open: Left -40, Right 40
+        # Cutter
         self.cutter_open_left = math.radians(-40.0)
         self.cutter_open_right = math.radians(40.0)
-        # Close: Both 0
-        self.cutter_closed_val = math.radians(0.0)
+        self.cutter_closed_val = math.radians(0.0)  # Cut/Rest
 
-        # Rest (Arm)
+        # Arm Rest (0 deg)
         self.rest_joints_deg = [0.0, 0.0, 0.0, 0.0, 0.0] 
         self.rest_joints_rad = [math.radians(a) for a in self.rest_joints_deg]
         self.arm_joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
 
         self.target_sub = self.create_subscription(PoseStamped, '/harvest_target/pose', self.target_callback, 10)
-        
-        # Publishers
-        self.display_path_pub = self.create_publisher(DisplayTrajectory, '/move_group/display_planned_path', 10)
-        
         self.move_group_client = ActionClient(self, MoveGroup, 'move_action')
         self.clear_octomap_client = self.create_client(Empty, '/clear_octomap')
 
@@ -58,7 +53,11 @@ class HarvestControlNode(Node):
 
         self.get_logger().info("Waiting for MoveIt...")
         self.move_group_client.wait_for_server()
-        self.get_logger().info("READY. Using Cutter Group for Simulation.")
+        self.get_logger().info("READY. MODE: LIVE ACTION (Real Cutting).")
+        
+        # Optional: Reset tools to closed state on startup? 
+        # Uncomment next line if you want immediate reset
+        # self.execute_tool_command("BOTH_CLOSE", "IDLE", plan_only=False)
 
     def target_callback(self, msg):
         if self.state != "IDLE": return
@@ -66,52 +65,53 @@ class HarvestControlNode(Node):
         if dist > self.max_reach: return
 
         self.latest_target = msg
-        self.get_logger().info("Tomato Detected. Preparing Tools...")
-        # Step 1: Open BOTH Gripper and Cutter (Real)
+        self.get_logger().info("Tomato Detected! Preparing Tools...")
+        # Step 1: Open Everything
         self.execute_tool_command("BOTH_OPEN", "PRE_APPROACH", plan_only=False)
 
     def execute_tool_command(self, command_type, next_state, plan_only=False):
         self.state = next_state
         goal_msg = MoveGroup.Goal()
         
-        # Select Group based on command
-        if command_type == "GRIPPER_CLOSE":
+        # --- COMMAND SELECTOR ---
+        if command_type == "GRIPPER_HOLD":
             goal_msg.request.group_name = self.gripper_group_name
+            joints = self.gripper_joints
+            target_val = self.gripper_hold_val
+            
+        elif command_type == "GRIPPER_CLOSE": # Fully closed
+            goal_msg.request.group_name = self.gripper_group_name
+            joints = self.gripper_joints
             target_val = self.gripper_closed_val
-            joints = self.gripper_joints
-        elif command_type == "GRIPPER_OPEN":
-            goal_msg.request.group_name = self.gripper_group_name
-            target_val = self.gripper_open_val
-            joints = self.gripper_joints
-        elif command_type == "CUTTER_CLOSE":
-            goal_msg.request.group_name = self.cutter_group_name
-            # Handled specially below due to asymmetric joints
-            joints = self.cutter_joints
-        elif command_type == "CUTTER_OPEN":
+
+        elif command_type == "CUTTER_CLOSE": # The Cut
             goal_msg.request.group_name = self.cutter_group_name
             joints = self.cutter_joints
+            
         elif command_type == "BOTH_OPEN":
-            # For simplicity, we just open the Cutter first here, Gripper logic loops
+            goal_msg.request.group_name = self.cutter_group_name # We drive cutter here, gripper logic handled via iteration if needed
+            joints = self.cutter_joints
+            
+        elif command_type == "BOTH_CLOSE": # For Rest
             goal_msg.request.group_name = self.cutter_group_name
             joints = self.cutter_joints
 
         # Options
         goal_msg.planning_options.plan_only = plan_only
-        goal_msg.planning_options.look_around = False
-        goal_msg.planning_options.replan = False
-
+        
         constraints = Constraints()
         
-        # --- JOINT LOGIC ---
-        if command_type == "CUTTER_OPEN" or command_type == "BOTH_OPEN":
-            # Asymmetric Open: Left -40, Right 40
+        # --- JOINT CONSTRAINTS ---
+        if command_type == "BOTH_OPEN":
+            # 1. Cutter Open
             jc1 = JointConstraint(joint_name="left_cutter_joint", position=self.cutter_open_left, tolerance_above=0.01, tolerance_below=0.01, weight=1.0)
             jc2 = JointConstraint(joint_name="right_cutter_joint", position=self.cutter_open_right, tolerance_above=0.01, tolerance_below=0.01, weight=1.0)
             constraints.joint_constraints.append(jc1)
             constraints.joint_constraints.append(jc2)
+            # (We will open gripper in the callback)
             
-        elif command_type == "CUTTER_CLOSE":
-            # Close: Both 0
+        elif command_type == "BOTH_CLOSE" or command_type == "CUTTER_CLOSE":
+            # Cutter Closed (0)
             for j in self.cutter_joints:
                 jc = JointConstraint(joint_name=j, position=self.cutter_closed_val, tolerance_above=0.01, tolerance_below=0.01, weight=1.0)
                 constraints.joint_constraints.append(jc)
@@ -134,53 +134,72 @@ class HarvestControlNode(Node):
         goal_handle.get_result_async().add_done_callback(self.tool_result_callback)
 
     def tool_result_callback(self, future):
-        result = future.result().result
-        
-        # --- SEQUENCE LOGIC ---
+        # --- STATE MACHINE SEQUENCE ---
 
-        # 1. CUTTER OPENED -> NOW OPEN GRIPPER
+        # 1. CUTTER OPENED -> OPEN GRIPPER
         if self.state == "PRE_APPROACH":
             self.get_logger().info("Cutter Open. Opening Gripper...")
-            # We recursively call to open gripper, but change state to APPROACH
-            self.execute_tool_command("GRIPPER_OPEN", "APPROACHING", plan_only=False)
+            # Reuse the single Open command but change state
+            self.execute_single_gripper("OPEN", "APPROACHING")
 
-        # 2. GRIPPER OPENED -> MOVE ARM
+        # 2. TOOLS READY -> MOVE ARM
         elif self.state == "APPROACHING":
             self.clear_octomap()
-            self.get_logger().info("Tools Ready. Moving Arm...")
+            self.get_logger().info("Moving Arm to Tomato...")
             self.execute_arm_move()
 
-        # 3. ARM ARRIVED -> GRIP (REAL)
+        # 3. ARM ARRIVED -> GRIP (HOLD)
         elif self.state == "GRIPPING":
-            self.get_logger().info("At Target. Gripping...")
-            self.execute_tool_command("GRIPPER_CLOSE", "SIMULATING_CUT", plan_only=False)
+            self.get_logger().info("Gripping Tomato...")
+            self.execute_tool_command("GRIPPER_HOLD", "CUTTING", plan_only=False)
 
-        # 4. GRIPPED -> SIMULATE CUTTER (GHOST)
-        elif self.state == "SIMULATING_CUT":
-            self.get_logger().info("Gripped! Simulating Cutter Action...")
-            # Plan ONLY (True) for Cutter Close
-            self.execute_tool_command("CUTTER_CLOSE", "DISPLAY_CUT", plan_only=True)
+        # 4. GRIPPED -> PERFORM CUT (REAL)
+        elif self.state == "CUTTING":
+            time.sleep(0.5) # Small pause before cut
+            self.get_logger().info("PERFORMING CUT ACTION...")
+            self.execute_tool_command("CUTTER_CLOSE", "RELEASING", plan_only=False)
 
-        # 5. DISPLAY CUT ANIMATION
-        elif self.state == "DISPLAY_CUT":
-            if result.error_code.val == 1:
-                traj = result.planned_trajectory
-                display_msg = DisplayTrajectory()
-                display_msg.model_id = "cocoabot"
-                display_msg.trajectory.append(traj)
-                
-                self.get_logger().info("Visualizing Cut in RViz...")
-                for i in range(5): # Loop 5 times
-                    self.display_path_pub.publish(display_msg)
-                    time.sleep(0.8)
-            
-            self.get_logger().info("Cut Done. Releasing...")
-            self.execute_tool_command("GRIPPER_OPEN", "RELEASING", plan_only=False)
-
-        # 6. RELEASED -> RETREAT
+        # 5. CUT DONE -> OPEN EVERYTHING
         elif self.state == "RELEASING":
-            self.get_logger().info("Released. Retreating...")
-            self.execute_linear_pullback()
+            time.sleep(0.5) 
+            self.get_logger().info("Releasing...")
+            # We open cutter first
+            self.execute_tool_command("BOTH_OPEN", "FINAL_OPEN", plan_only=False)
+            
+        # 6. CUTTER OPEN -> OPEN GRIPPER
+        elif self.state == "FINAL_OPEN":
+             self.execute_single_gripper("OPEN", "RETREATING")
+
+        # 7. OPEN -> MOVE TO REST
+        elif self.state == "RETREATING":
+            self.get_logger().info("Moving to Rest Position...")
+            self.execute_move_to_rest()
+            
+        # 8. AT REST -> CLOSE EVERYTHING (RESET)
+        elif self.state == "RESETTING":
+            self.get_logger().info("Closing Tools (Reset)...")
+            self.execute_tool_command("BOTH_CLOSE", "FINAL_RESET", plan_only=False)
+
+        # 9. CUTTER CLOSED -> CLOSE GRIPPER
+        elif self.state == "FINAL_RESET":
+            self.execute_single_gripper("CLOSE", "IDLE")
+
+    # --- HELPER: SINGLE GRIPPER COMMAND ---
+    def execute_single_gripper(self, action, next_state):
+        self.state = next_state
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request.group_name = self.gripper_group_name
+        
+        target = self.gripper_open_val if action == "OPEN" else self.gripper_closed_val
+        
+        constraints = Constraints()
+        for j in self.gripper_joints:
+            jc = JointConstraint(joint_name=j, position=float(target), tolerance_above=0.01, tolerance_below=0.01, weight=1.0)
+            constraints.joint_constraints.append(jc)
+        goal_msg.request.goal_constraints.append(constraints)
+        
+        self.move_group_client.send_goal_async(goal_msg).add_done_callback(self.tool_response_callback)
+
 
     def clear_octomap(self):
         if self.clear_octomap_client.service_is_ready():
@@ -229,16 +248,50 @@ class HarvestControlNode(Node):
 
     def arm_result_callback(self, future):
         if future.result().result.error_code.val == 1:
-            # Arm arrived. Trigger the Gripping sequence in the callback chain
             self.state = "GRIPPING"
-            self.tool_result_callback(future) # Manually call next step
+            self.tool_result_callback(future) 
         else:
             self.state = "IDLE"
 
-    # --- RETREAT LOGIC ---
-    def execute_linear_pullback(self):
-        self.state = "PULLING_BACK"
-        retreat_pose = copy.deepcopy(self.latest_target)
-        retreat_pose.pose.position.x -= 0.12 
+    def execute_move_to_rest(self):
+        self.state = "MOVING_TO_REST"
+        self.clear_octomap()
         
-        goal
+        goal_msg = MoveGroup.Goal()
+        goal_msg.request.group_name = self.arm_group_name
+        goal_msg.request.max_velocity_scaling_factor = 0.4
+        
+        constraints = Constraints()
+        for i, joint_name in enumerate(self.arm_joint_names):
+            jc = JointConstraint()
+            jc.joint_name = joint_name
+            jc.position = self.rest_joints_rad[i]
+            jc.tolerance_above = 0.05
+            jc.tolerance_below = 0.05
+            jc.weight = 1.0
+            constraints.joint_constraints.append(jc)
+            
+        goal_msg.request.goal_constraints.append(constraints)
+
+        self.move_group_client.send_goal_async(goal_msg).add_done_callback(self.rest_response_callback)
+
+    def rest_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.state = "IDLE"
+            return
+        goal_handle.get_result_async().add_done_callback(self.rest_result_callback)
+
+    def rest_result_callback(self, future):
+        self.get_logger().info("At Rest. Resetting tools...")
+        self.state = "RESETTING"
+        self.tool_result_callback(future)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = HarvestControlNode()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
