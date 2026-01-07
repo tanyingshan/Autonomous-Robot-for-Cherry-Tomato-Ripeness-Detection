@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 import os
+import datetime
 from ament_index_python.packages import get_package_share_directory
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 import math
@@ -31,6 +32,17 @@ class TomatoPerceptionNode(Node):
         self.depth_image = None
         self.frame_count = 0 
 
+        # --- LOGGING SETUP ---
+        # Creates a folder to save images and a CSV file for coordinates
+        self.log_dir = os.path.expanduser("~/harvest_logs")
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+        self.csv_file = os.path.join(self.log_dir, "harvest_data.csv")
+        # Initialize CSV header if file doesn't exist
+        if not os.path.exists(self.csv_file):
+            with open(self.csv_file, "w") as f:
+                f.write("Timestamp,Tomato_ID,X_Base,Y_Base,Z_Base,Stem_Angle_Deg\n")
+        
         # TF Buffer
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -48,8 +60,8 @@ class TomatoPerceptionNode(Node):
         # --- UI: STARTUP BANNER ---
         print("\n" + "="*60)
         print("   TOMATO PERCEPTION NODE | STATUS: ONLINE")
-        print("   [VISUALS]: Bounding Box + Green Stem Mask Overlay")
-        print("   [LOGIC]  : SMART DEPTH SEARCH (Spiral Scan)")
+        print(f"   [DATA LOGGING]: Saving to {self.log_dir}")
+        print("   [VISUALS]     : Green Mask Shade Active")
         print("="*60 + "\n")
 
     def info_callback(self, msg):
@@ -67,36 +79,41 @@ class TomatoPerceptionNode(Node):
         q.w = math.cos(angle_rad / 2.0)
         return q
 
+    # --- HELPER: SAVE LOGS ---
+    def save_harvest_log(self, frame, x, y, z, angle):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # 1. Save Image
+        img_filename = f"harvest_{timestamp}.jpg"
+        img_path = os.path.join(self.log_dir, img_filename)
+        cv2.imwrite(img_path, frame)
+        
+        # 2. Append to CSV
+        with open(self.csv_file, "a") as f:
+            f.write(f"{timestamp},tomato_{timestamp},{x:.4f},{y:.4f},{z:.4f},{angle:.2f}\n")
+            
+        self.get_logger().info(f"[DATA SAVED] Logged to {img_filename}")
+
     # --- HELPER: SPIRAL SEARCH FOR VALID DEPTH ---
     def get_valid_depth(self, u, v, max_radius=10):
-        """Searches neighbors if center pixel is 0/invalid"""
         if self.depth_image is None: return 0.0
-        
         h, w = self.depth_image.shape
-        # Check center first
         z = float(self.depth_image[v, u])
         if z > 100 and z < 2000: return z
         
-        # Spiral search
         for r in range(1, max_radius + 1):
-            # Check 8 neighbors at radius r
-            neighbors = [
-                (u-r, v), (u+r, v), (u, v-r), (u, v+r),
-                (u-r, v-r), (u+r, v+r), (u-r, v+r), (u+r, v-r)
-            ]
+            neighbors = [(u-r, v), (u+r, v), (u, v-r), (u, v+r),
+                         (u-r, v-r), (u+r, v+r), (u-r, v+r), (u+r, v-r)]
             valid_depths = []
             for nu, nv in neighbors:
                 if 0 <= nu < w and 0 <= nv < h:
                     val = float(self.depth_image[nv, nu])
                     if val > 100 and val < 2000:
                         valid_depths.append(val)
-            
             if valid_depths:
-                return np.mean(valid_depths) # Return average of valid neighbors
-        
-        return 0.0 # Failed
+                return np.mean(valid_depths)
+        return 0.0
 
-    # --- UI HELPER: Calculate 3D Point for Logging ---
     def calculate_3d_point(self, u, v, depth_val):
         if depth_val <= 0: return None
         fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
@@ -116,6 +133,7 @@ class TomatoPerceptionNode(Node):
             return
         
         results_ripeness = self.model_ripeness(cv_image, conf=0.5, verbose=False)
+        # We copy the image so we can draw the shade without affecting logic
         display_frame = results_ripeness[0].plot() 
         
         total_tomatoes = len(results_ripeness[0].boxes)
@@ -151,14 +169,19 @@ class TomatoPerceptionNode(Node):
                     mask_binary = stem_res.masks.data[0].cpu().numpy()
                     mask_binary = cv2.resize(mask_binary, (roi_img.shape[1], roi_img.shape[0]))
                     
-                    # --- UI: GREEN MASK SHADE ---
+                    # --- UI: GREEN MASK SHADE (Improved) ---
+                    # Create green overlay on the ROI
                     roi_display = display_frame[roi_y1:roi_y2, roi_x1:roi_x2]
                     green_mask = np.zeros_like(roi_display)
+                    
+                    # Identify mask pixels
                     mask_indices = mask_binary > 0.5
                     
                     if np.any(mask_indices):
-                        green_mask[mask_indices] = [0, 255, 0] 
+                        green_mask[mask_indices] = [0, 255, 0] # Green color
+                        # Blend: 60% Source, 40% Green
                         cv2.addWeighted(roi_display, 0.6, green_mask, 0.4, 0, roi_display)
+                    # ---------------------------------------
 
                     mask_coords = np.argwhere(mask_binary > 0.5) 
 
@@ -168,6 +191,7 @@ class TomatoPerceptionNode(Node):
                         u_stem = u_roi + roi_x1
                         v_stem = v_roi + roi_y1
 
+                        # Draw Visuals
                         cv2.circle(display_frame, (u_stem, v_stem), 6, (0, 255, 0), -1)
                         cv2.line(display_frame, (tomato_cx, tomato_cy), (u_stem, v_stem), (255, 255, 0), 1)
 
@@ -183,66 +207,64 @@ class TomatoPerceptionNode(Node):
                             stem_angle = -1.57 
 
                         try:
-                            # --- SMART DEPTH SEARCH ---
-                            # 1. Get Reliable Tomato Depth (Spiral Search if center is bad)
-                            z_tomato = self.get_valid_depth(tomato_cx, tomato_cy, max_radius=15)
-                            
-                            # 2. Get Raw Stem Depth
-                            z_stem_raw = self.get_valid_depth(u_stem, v_stem, max_radius=5)
+                            # Using original logic as requested (Spiral only)
+                            z_stem = self.get_valid_depth(u_stem, v_stem, max_radius=10)
 
-                            # 3. LOGIC: Force Stem Z to match Tomato Z
-                            # Stems are too thin for depth cameras. Trust the tomato body.
-                            if z_tomato > 0:
-                                z_final = z_tomato # Use TOMATO depth for everything
-                            elif z_stem_raw > 0:
-                                z_final = z_stem_raw # Fallback
-                            else:
-                                continue # Both invalid, skip
+                            if z_stem > 0:
+                                fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
+                                cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
+                                
+                                x_opt = (u_stem - cx) * z_stem / fx / 1000.0
+                                y_opt = (v_stem - cy) * z_stem / fy / 1000.0
+                                z_opt = z_stem / 1000.0
 
-                            # Calculate 3D
-                            fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
-                            cx, cy = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
-                            
-                            # CRITICAL: Use STEM (u,v) but TOMATO (z)
-                            x_opt = (u_stem - cx) * z_final / fx / 1000.0
-                            y_opt = (v_stem - cy) * z_final / fy / 1000.0
-                            z_opt = z_final / 1000.0
+                                pose_optical = PoseStamped()
+                                pose_optical.header.stamp = self.get_clock().now().to_msg()
+                                pose_optical.header.frame_id = "camera_depth_optical_frame"
+                                pose_optical.pose.position.x = x_opt
+                                pose_optical.pose.position.y = y_opt
+                                pose_optical.pose.position.z = z_opt
+                                pose_optical.pose.orientation = self.get_quaternion_from_angle(stem_angle)
 
-                            pose_optical = PoseStamped()
-                            pose_optical.header.stamp = self.get_clock().now().to_msg()
-                            pose_optical.header.frame_id = "camera_depth_optical_frame"
-                            pose_optical.pose.position.x = x_opt
-                            pose_optical.pose.position.y = y_opt
-                            pose_optical.pose.position.z = z_opt
-                            pose_optical.pose.orientation = self.get_quaternion_from_angle(stem_angle)
+                                try:
+                                    transform = self.tf_buffer.lookup_transform(
+                                        'base_link', 'camera_depth_optical_frame', rclpy.time.Time())
+                                    
+                                    pose_base = do_transform_pose(pose_optical.pose, transform)
+                                    
+                                    # --- FORMATTED LOGGING ---
+                                    # Calculate Grip Point just for comparison display
+                                    z_tomato = self.get_valid_depth(tomato_cx, tomato_cy)
+                                    grip_pt = self.calculate_3d_point(tomato_cx, tomato_cy, z_tomato)
+                                    
+                                    # Formatted strings
+                                    grip_str = f"({grip_pt[0]:6.2f}, {grip_pt[1]:6.2f}, {grip_pt[2]:6.2f})" if grip_pt else "   N/A   "
+                                    cut_str =  f"({pose_base.position.x:6.2f}, {pose_base.position.y:6.2f}, {pose_base.position.z:6.2f})"
+                                    
+                                    self.get_logger().info(
+                                        f"\n[VISION] TARGET LOCK ACQUIRED (Base Frame):\n"
+                                        f"   > GRIP (Tomato) : {grip_str}\n"
+                                        f"   > CUT  (Stem)   : {cut_str}\n"
+                                        f"   > APPROACH ANGLE: {np.degrees(stem_angle):.1f} deg"
+                                    )
+                                    
+                                    # --- SAVE LOGS ---
+                                    self.save_harvest_log(
+                                        display_frame, 
+                                        pose_base.position.x, 
+                                        pose_base.position.y, 
+                                        pose_base.position.z, 
+                                        np.degrees(stem_angle)
+                                    )
 
-                            try:
-                                transform = self.tf_buffer.lookup_transform(
-                                    'base_link', 'camera_depth_optical_frame', rclpy.time.Time())
-                                
-                                pose_base = do_transform_pose(pose_optical.pose, transform)
-                                
-                                # --- LOGGING (Consistent Data) ---
-                                grip_pt = self.calculate_3d_point(tomato_cx, tomato_cy, z_final)
-                                
-                                grip_str = f"({grip_pt[0]:6.2f}, {grip_pt[1]:6.2f}, {grip_pt[2]:6.2f})" if grip_pt else "   N/A   "
-                                cut_str =  f"({pose_base.position.x:6.2f}, {pose_base.position.y:6.2f}, {pose_base.position.z:6.2f})"
-                                
-                                self.get_logger().info(
-                                    f"\n[VISION] TARGET LOCK ACQUIRED:\n"
-                                    f"   > GRIP (Tomato) : {grip_str}\n"
-                                    f"   > CUT  (Stem)   : {cut_str}\n"
-                                    f"   > APPROACH ANGLE: {np.degrees(stem_angle):.1f} deg"
-                                )
-
-                                target_msg = PoseStamped()
-                                target_msg.header.stamp = self.get_clock().now().to_msg()
-                                target_msg.header.frame_id = "base_link"
-                                target_msg.pose = pose_base
-                                self.target_pub.publish(target_msg)
-                                
-                            except Exception:
-                                pass
+                                    target_msg = PoseStamped()
+                                    target_msg.header.stamp = self.get_clock().now().to_msg()
+                                    target_msg.header.frame_id = "base_link"
+                                    target_msg.pose = pose_base
+                                    self.target_pub.publish(target_msg)
+                                    
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
 
