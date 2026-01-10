@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'tomato_node = tomato_perception.tomato_node:main',
             'harvest_control = tomato_perception.harvest_control:main',
+            'streamlit_ui = tomato_perception.streamlit_ui:main',
         ],
     },
 )
