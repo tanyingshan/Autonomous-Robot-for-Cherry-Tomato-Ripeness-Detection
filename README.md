@@ -1,4 +1,4 @@
-# Autonomous Cherry Tomato Harvesting Robot 
+# Autonomous Robot for Cherry Tomato Ripeness Detection
 
 ##  Project Overview
 This ROS 2 package controls an autonomous robotic arm to identify, approach, and harvest ripe cherry tomatoes. It integrates **YOLOv8** for real-time detection, **RGB-D Perception** for depth estimation, and **MoveIt** for motion planning. A user-friendly **Streamlit Dashboard** is included for live monitoring.
